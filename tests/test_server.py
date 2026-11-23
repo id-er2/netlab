@@ -1,4 +1,6 @@
 import socket
+import threading
+import time
 import unittest
 
 from netlab.server import LabServer, ScanDetector
@@ -54,6 +56,51 @@ class LabServerTest(unittest.TestCase):
     def test_non_loopback_bind_refused(self):
         with self.assertRaises(ValueError):
             LabServer(host="0.0.0.0")
+
+
+class HandlerThreadBoundTest(unittest.TestCase):
+    def test_handler_threads_are_bounded_and_none_dropped(self):
+        port = free_port()
+        active = 0
+        peak = 0
+        done = 0
+        lock = threading.Lock()
+        srv = LabServer(
+            services=[{"port": port, "service": "http", "banner": ""}],
+            log=lambda msg: None, max_handler_threads=2)
+        orig_handle = srv._handle
+
+        def counting(conn, addr, svc):
+            nonlocal active, peak, done
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                orig_handle(conn, addr, svc)
+            finally:
+                with lock:
+                    active -= 1
+                    done += 1
+
+        srv._handle = counting
+        srv.start()
+        try:
+            # Six idle clients: each handler waits out its 1s recv
+            # timeout, so without a bound six threads would pile up.
+            conns = [socket.create_connection(("127.0.0.1", port), timeout=5)
+                     for _ in range(6)]
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                with lock:
+                    if done == 6:
+                        break
+                time.sleep(0.05)
+            for conn in conns:
+                conn.close()
+        finally:
+            srv.stop()
+        self.assertEqual(done, 6)  # every connection still served
+        self.assertLessEqual(peak, 2)
 
 
 if __name__ == "__main__":

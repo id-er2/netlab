@@ -126,5 +126,40 @@ class ScanPortsTest(unittest.TestCase):
             scanner.scan_ports("8.8.8.8", [80])
 
 
+class ScanTargetPinningTest(unittest.TestCase):
+    def test_scan_connects_to_validated_address_not_hostname(self):
+        """The hostname is resolved once, validated, and the connection
+        goes to that address: DNS cannot change its answer between the
+        check and the connect."""
+        fake_info = [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                      ("127.0.0.1", 0))]
+        connected = []
+
+        class FakeConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, size):
+                raise socket.timeout()
+
+        def fake_create_connection(addr, timeout=None):
+            connected.append(addr)
+            return FakeConn()
+
+        with mock.patch.object(socket, "getaddrinfo",
+                               return_value=fake_info), \
+             mock.patch.object(socket, "create_connection",
+                               side_effect=fake_create_connection):
+            results = scanner.scan_ports("lab.test", [80])
+        self.assertEqual(connected, [("127.0.0.1", 80)])
+        self.assertEqual(results[0]["state"], "open")
+
+
 if __name__ == "__main__":
     unittest.main()

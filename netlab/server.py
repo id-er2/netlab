@@ -11,6 +11,10 @@ from collections import defaultdict, deque
 
 from .scanner import require_loopback
 
+# At most this many connections are handled at once; extra connections
+# wait at the accept loop instead of spawning more threads.
+MAX_HANDLER_THREADS = 32
+
 # Unprivileged ports impersonating the classic services, so the lab works
 # without root. ftp/ssh/smtp send a banner on connect, like the real
 # things; http stays quiet until it gets a request, like the real thing.
@@ -64,12 +68,21 @@ class ScanDetector:
 
 
 class LabServer:
-    """Serves the demo services on a loopback address."""
+    """Serves the demo services on a loopback address.
+
+    Connection handlers run in threads, but their number is bounded by
+    MAX_HANDLER_THREADS: a fast connect flood (for example a full-range
+    port scan against the lab) queues at the accept loop instead of
+    spawning one thread per connection until the machine runs out.
+    """
 
     def __init__(self, host="127.0.0.1", services=None, detector=None,
-                 log=None):
-        require_loopback(host)
-        self.host = host
+                 log=None, max_handler_threads=MAX_HANDLER_THREADS):
+        addrs = require_loopback(host)
+        if not isinstance(max_handler_threads, int) or max_handler_threads < 1:
+            raise ValueError("max_handler_threads must be a positive integer")
+        self.host = next((a for a in addrs if ":" not in a), addrs[0])
+        self._family = socket.AF_INET6 if ":" in self.host else socket.AF_INET
         self.services = (services if services is not None
                          else list(DEFAULT_SERVICES))
         self.detector = detector if detector is not None else ScanDetector()
@@ -78,10 +91,11 @@ class LabServer:
         self._sockets = []
         self._threads = []
         self._stop = threading.Event()
+        self._handler_slots = threading.BoundedSemaphore(max_handler_threads)
 
     def start(self):
         for svc in self.services:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock = socket.socket(self._family, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((self.host, svc["port"]))
             sock.listen(16)
@@ -103,8 +117,30 @@ class LabServer:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle, args=(conn, addr, svc),
-                             daemon=True).start()
+            # Block until a handler slot frees: concurrency stays bounded
+            # and every accepted connection is still served and recorded.
+            while not self._handler_slots.acquire(timeout=0.1):
+                if self._stop.is_set():
+                    conn.close()
+                    return
+            if self._stop.is_set():
+                self._handler_slots.release()
+                conn.close()
+                return
+            try:
+                threading.Thread(target=self._handle_guarded,
+                                 args=(conn, addr, svc),
+                                 daemon=True).start()
+            except Exception:
+                self._handler_slots.release()
+                conn.close()
+                raise
+
+    def _handle_guarded(self, conn, addr, svc):
+        try:
+            self._handle(conn, addr, svc)
+        finally:
+            self._handler_slots.release()
 
     def _handle(self, conn, addr, svc):
         source = addr[0]

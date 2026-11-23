@@ -67,15 +67,21 @@ def scan_ports(host, ports, timeout=1.0, banner_timeout=0.5, max_banner=64):
 
     Returns a list of dicts: port, state ('open'/'closed'), service,
     banner (if the service sent one) and latency_ms.
+
+    The scan connects to the address require_loopback() already resolved
+    and validated, not to the hostname again: a name that answered with
+    a loopback address at check time cannot answer differently when the
+    connection is made.
     """
-    require_loopback(host)
+    addrs = require_loopback(host)
+    target = addrs[0]
     results = []
     for port in ports:
         started = time.monotonic()
         state = "closed"
         banner = ""
         try:
-            with socket.create_connection((host, port), timeout=timeout) as conn:
+            with socket.create_connection((target, port), timeout=timeout) as conn:
                 state = "open"
                 conn.settimeout(banner_timeout)
                 try:
